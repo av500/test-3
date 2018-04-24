@@ -15,7 +15,7 @@
 
 // These values together define the firmware version number, shown on the display during startup. For example, major 1 and minor 0 together form '1.0'. Values above 9 are not possible.
 #define versionMajor 1
-#define versionMinor 0
+#define versionMinor 1
 
 // Minimum time needed to register a button 'hold' event, in ms. Default: 1000.
 #define buttonHoldTime 1000
@@ -63,6 +63,7 @@ volatile byte rail;
 volatile byte mode, previousMode;
 
 volatile byte peakUpdate;
+volatile byte relUpdate;
 
 // Measured values for each rail are stored in an array. Index corresponds to mode.
 // (SevenSeg library requires signed variables.)
@@ -70,14 +71,22 @@ int plus5Data[3];
 int plus12Data[3];
 int minus12Data[3];
 
+// stored current values
+int plus5Current;
+int plus12Current;
+int minus12Current;
+
 // Display segment and digit pins.
 SevenSeg disp(dispSegmentAPin, dispSegmentBPin, dispSegmentCPin, dispSegmentDPin, dispSegmentEPin, dispSegmentFPin, dispSegmentGPin);
 const int digitPins[5] = {dispLEDPin, dispDigit1Pin, dispDigit2Pin, dispDigit3Pin, dispDigit4Pin};
 
 // Varioubles: various variables.
 volatile bool updateRailMemory, updateModeMemory, lastRailButtonState, lastModeButtonState, modeButtonHeld, peakResetCanceled, displayBlinking, displayBlinkState;
+volatile bool railButtonHeld, LEDBlinking;
 volatile unsigned long modeButtonPushTime;
+volatile unsigned long railButtonPushTime;
 volatile byte dispDigitCounter, buttonPollCounter;
+bool relativeMode = LOW;
 
 void setup()
 {
@@ -287,15 +296,15 @@ void loop()
   minus12VoltTopAverage = 0;
 
   plus5CurrentTopAverage /= 10;
-  plus5Data[1] = plus5CurrentTopAverage;
+  plus5Data[1] = relativeMode ? (plus5CurrentTopAverage - plus5Current) : plus5CurrentTopAverage;
   plus5CurrentTopAverage = 0;
 
   plus12CurrentTopAverage /= 10;
-  plus12Data[1] = plus12CurrentTopAverage;
+  plus12Data[1] = relativeMode ? (plus12CurrentTopAverage - plus12Current) : plus12CurrentTopAverage;
   plus12CurrentTopAverage = 0;
 
   minus12CurrentTopAverage /= 10;
-  minus12Data[1] = minus12CurrentTopAverage;
+  minus12Data[1] = relativeMode ? (minus12CurrentTopAverage - minus12Current) : minus12CurrentTopAverage;
   minus12CurrentTopAverage = 0;
 
   // 2. UPDATE THE EEPROM
@@ -326,6 +335,7 @@ void timer1ISR()
 {
   // 1. UPDATE THE DISPLAY
   int dispValue;
+  int negative = 0;
 
   // Get the measurement data for the selected rail and mode.
   switch (rail)
@@ -343,6 +353,12 @@ void timer1ISR()
       break;
   }
 
+  if( mode == 1 && dispValue < 0 )
+  {
+    dispValue = -dispValue;
+    negative = 1;
+  }
+
   // Blink the display if the real-time measurement is overloaded (V >= 20.47 V, mA >= 1000).
   if (((mode == 0) && (dispValue >= 2046)) || ((mode == 1) && (dispValue >= 1000)))
   {
@@ -352,6 +368,13 @@ void timer1ISR()
   else if (mode < 2)
   {
     displayBlinking = LOW;
+  }
+
+  if (relUpdate > 0)
+  {
+    disp.write(relativeMode ? " rel" : " abs");
+    relUpdate--;
+    goto SKIP_DISPLAY;
   }
 
   // Clear the display to avoid ghosting on the rail and mode LEDs.
@@ -386,7 +409,10 @@ void timer1ISR()
           break;
 
         case 1:
-          digitalWrite(dispSegmentEPin, dispPolarity);
+          if(!LEDBlinking || displayBlinkState)
+          {
+            digitalWrite(dispSegmentEPin, dispPolarity);
+          }
           break;
 
         case 2:
@@ -410,19 +436,27 @@ void timer1ISR()
         if (dispValue >= 1000)
         {
           dispValue /= 1000;
+          disp.writeDigit(dispValue);
         }
         // ... otherwise, blank the digit (leading zero suppression).
         else
         {
-          dispValue = ' ';
+          // ... or maybe show minus sign if we are doing relative current
+          if(negative)
+          {
+            disp.writeDigit('-');
+          }
+          else
+          {
+            disp.writeDigit(' ');
+          }
         }
       }
       else
       {
-        dispValue = ' ';
+        disp.writeDigit(' ');
       }
 
-      disp.writeDigit(dispValue);
       break;
 
     case 2:
@@ -517,6 +551,8 @@ void timer1ISR()
     dispDigitCounter = 0;
   }
 
+SKIP_DISPLAY:
+
   // 2. POLL THE BUTTONS
   // Poll once every 10 Timer2 interrupt cycles (= 10 Hz), for debouncing.
   if (buttonPollCounter < 9)
@@ -537,7 +573,7 @@ void timer1ISR()
         displayBlinking = LOW;
         peakResetCanceled = HIGH;
       }
-      else
+      else if (!railButtonHeld)
       // ...otherwise, cycle through the rails.
       {
         if (rail < 2)
@@ -552,11 +588,34 @@ void timer1ISR()
         updateRailMemory = HIGH;
       }
 
+      railButtonHeld = LOW;
       lastRailButtonState = HIGH;
     }
     else if (!digitalRead(railButtonPin) && (lastRailButtonState == HIGH))
     {
+      // Store the time the mode button is pushed down, to detect 'hold' events.
+      railButtonHeld = LOW;
       lastRailButtonState = LOW;
+      railButtonPushTime = millis();
+    }
+    else if (!digitalRead(railButtonPin) && ((millis() - railButtonPushTime) >= buttonHoldTime) && !railButtonHeld)
+    {
+      // Rail button is held down;
+      if( relativeMode == HIGH )
+      {
+        relativeMode = LOW;
+        LEDBlinking = LOW;
+      }
+      else
+      {
+        plus5Current = plus5Data[1];
+        plus12Current = plus12Data[1];
+        minus12Current = minus12Data[1];
+        relativeMode = HIGH;
+        LEDBlinking = HIGH;
+      }
+      relUpdate = 100;
+      railButtonHeld = HIGH;
     }
 
     // Poll the mode button.
